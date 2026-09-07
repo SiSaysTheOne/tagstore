@@ -1,14 +1,79 @@
 from pathlib import Path
 import filecmp
 import shutil
-from tagstore.TimeFormats import get_time
-from tagstore.FileSystemUtils import FileSystemUtils
+import b2sdk.v2 as b2
+from tagstore.lib.TimeFormats import get_time
+from tagstore.lib.FileSystemUtils import FileSystemUtils
 from tagstudio.core.library.alchemy.fields import TextField
 from tagstudio.core.library.alchemy.library import Library
 from tagstudio.core.library.alchemy.models import Tag
 from datetime import datetime as dt
 from tagstudio.core.library.alchemy.models import Entry
 
+class fs_driver_local:
+    # Implement local filesystem driver for uploading files to a local directory
+
+    def __init__(self, root_dir: Path) -> None:
+        self.root_dir = root_dir
+
+    def upload(self, local_path: Path, remote_path: str) -> None:
+        destination = self.root_dir / remote_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, destination)
+
+    def fetch_metadata(self) -> dict[str, dict]:
+        metadata = {}
+        for file in self.root_dir.rglob("*"):
+            if file.is_file():
+                metadata[file.relative_to(self.root_dir).as_posix()] = {
+                    "size": file.stat().st_size,
+                    "modified_time": file.stat().st_mtime,
+                }
+        return metadata
+
+class fs_driver_B2:
+    # Implement Backblaze B2 driver for uploading files to B2 cloud storage
+
+    def __init__(self, key_id: str, app_key: str, bucket_name: str) -> None:
+        self.key_id = key_id
+        self.app_key = app_key
+        self.bucket_name = bucket_name
+        self.bucket: b2.Bucket | None = None
+        self.metadata_cache: dict[str, b2.FileVersion] = {}
+
+    def auth(self) -> b2.Bucket:
+        info = b2.InMemoryAccountInfo()
+        api = b2.B2Api(info)
+        api.authorize_account("production", self.key_id, self.app_key)
+        self.bucket = api.get_bucket_by_name(self.bucket_name)
+        return self.bucket
+
+    def upload(self, local_path: Path, remote_path: str) -> None:
+        if self.bucket is None:
+            raise RuntimeError("Not authenticated; call auth() first.")
+
+        # TODO: Handle large files, retries, and progress reporting as needed.
+        self.bucket.upload_local_file(local_file=str(local_path), file_name=remote_path)
+
+    def fetch_metadata(self, force_refresh: bool = False) -> dict[str, b2.FileVersion]:
+        if self.bucket is None:
+            raise RuntimeError("Not authenticated; call auth() first.")
+
+        if self.metadata_cache and not force_refresh:
+            return self.metadata_cache
+
+        # TODO: Narrow this down to whatever metadata fields are actually needed downstream.
+        for file_version, _ in self.bucket.ls(latest_only=True):
+            self.metadata_cache[file_version.file_name] = file_version
+
+        return self.metadata_cache
+
+    # TODO Decide how you want the backup to work and what its responsibilities are
+
+    # Clones the .TagStore directory from the backup
+    # TODO def fetch_library
+
+# TODO: Convert to fs_driver_local
 class LibUtils:
     tag_cache: dict[tuple[Library, str], Tag] = {}
     
@@ -33,12 +98,14 @@ class LibUtils:
     @staticmethod
     def tag_directory_hierarchy(lib: Library, path: Path, entry_id: int) -> None:
         parts = [part for part in path.parent.parts if part not in (".", "")]
+        print(f"tagging entry {entry_id} with path {path} with directory hierarchy: {parts}")
         if not parts:
             return
 
         parent_tag: Tag | None = None
         for part in parts:
-            parent_tag = LibUtils.get_or_create_tag(lib, part, parent_tag)
+            parent_tag = LibUtils.get_or_create_tag(lib=lib, name=part, parent=parent_tag)
+            print(f"created tag for entry {entry_id} with tag {parent_tag.name}")
 
         lib.add_tags_to_entries(entry_ids=entry_id, tag_ids=parent_tag.id)
 
@@ -56,9 +123,9 @@ class LibUtils:
                     )])
 
     @staticmethod
-    def upload_file(lib: Library, uploaded_file: Path) -> Path | None:
+    def upload_file(lib: Library, files_dir: Path, uploaded_file: Path) -> Path | None:
     
-        relative = uploaded_file.relative_to(uploaded_file.parent)
+        relative = uploaded_file.relative_to(files_dir)
 
         # Generate hash
         file_hash = FileSystemUtils.hash_file(uploaded_file)
@@ -81,14 +148,15 @@ class LibUtils:
                 return existing_path
 
         # Copy file to library root with a new unique name
-        new_relative_path = FileSystemUtils.find_new_path(lib.library_dir, uploaded_file.suffix)
-        new_full_path = Path(shutil.copy2(uploaded_file, lib.library_dir / new_relative_path))
-        if new_full_path != lib.library_dir / new_relative_path:
-            print(f"Copy failed: {uploaded_file} -> {lib.library_dir / new_relative_path}")
+        libFile_relativePath = FileSystemUtils.find_new_path(lib.library_dir, uploaded_file.suffix)
+        libFile_fullPath = Path(shutil.copy2(uploaded_file, lib.library_dir / libFile_relativePath))
+        if libFile_fullPath != lib.library_dir / libFile_relativePath:
+            print(f"Copy failed: {uploaded_file} -> {lib.library_dir / libFile_relativePath}")
             return None
 
+        # Create default tags
         entry_ids = lib.add_entries([Entry(
-            path=new_relative_path,
+            path=libFile_relativePath,
             folder=lib.folder,
             fields=[],
             date_added=dt.now(),
@@ -102,8 +170,7 @@ class LibUtils:
             field=TextField(name="name", value=uploaded_file.stem, is_multiline=False),
         )
 
-        file_time = get_time(uploaded_file.stem)
-        
+        file_time = get_time(uploaded_file.stem)        
         if file_time is not None:
             lib.add_field_to_entries(
                 entry_ids=entry_ids,
@@ -112,9 +179,10 @@ class LibUtils:
         else:
             print(f"Warning: Could not extract time from filename {uploaded_file.stem}")
 
+        print(f"tagging file {uploaded_file} with tags based on its directory hierarchy")
         LibUtils.tag_directory_hierarchy(lib, relative, entry_ids[0])
         # Return the new path of the file in the library after moving it to the root
-        return new_full_path
+        return libFile_fullPath
 
     @staticmethod
     def flatten_library(lib: Library) -> None:

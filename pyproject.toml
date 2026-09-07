@@ -13,7 +13,8 @@ dependencies = [
 ]
 
 [project.scripts]
-tagstore = "tagstore.main:main"
+tagstore-cli = "tagstore.cli.main:cli"
+tagstore-api = "tagstore.api.main:api"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tagstore"]
