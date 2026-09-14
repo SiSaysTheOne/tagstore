@@ -1,8 +1,11 @@
+import hashlib
 from pathlib import Path
 from tagstore.lib.LibraryUtils import LibUtils
 from tagstore.lib.FileSystemUtils import FileSystemUtils
+from tagstore.lib import B2S3Utils
 from tagstudio.core.library.alchemy.library import Library
 
+from botocore.exceptions import BotoCoreError, ClientError
 import click
 
 # TODO Consider implementing a function to copy TagStudio entries from another .TagStudio directory if it exists in the target
@@ -11,12 +14,40 @@ class ExceptionHandlingGroup(click.Group):
     def invoke(self, ctx):
         try:
             return super().invoke(ctx)
+        except (click.exceptions.Exit, click.Abort):
+            # Normal exit / Ctrl-C sentinels - let click handle them.
+            raise
         except Exception as e:
             click.echo(f"Error: {e}", err=True)
             ctx.exit(1)
 
 @click.group(cls=ExceptionHandlingGroup)
 def cli():
+    pass
+
+@cli.command()
+@click.option("--library-dir", required=True, help="Path to the library directory")
+@click.option("--bucket-path", required=True, help="Path to the cloud bucket")
+@click.option("--bucket-type", required=True, type=click.Choice(["b2"]), help="Type of the cloud bucket")
+def uploadLocalLibraryToBucket():
+    # TODO Implement this function to sync the local library to a cloud bucket
+
+    
+
+    # TODO Blindly push all files to the bucket
+    
+    pass
+
+@cli.command()
+@click.option("--library-dir", required=True, help="Path to the library directory")
+@click.option("--bucket-path", required=True, help="Path to the cloud bucket")
+@click.option("--bucket-type", required=True, type=click.Choice(["b2"]), help="Type of the cloud bucket")
+def syncLibraryFromBucket(library_dir: str, bucket_path: str, bucket_type: str):
+    # TODO Implement this function to sync the library from a cloud bucket to the local library
+    
+    # TODO Determine all files newer on the local store; push those files
+    # TODO Determine all files newer on the cloud store; pull those files
+    
     pass
 
 @cli.command()
@@ -70,5 +101,148 @@ def copyFilesToLibrary(library_dir: str, files_dir: str, delete_source: bool) ->
     if(lib_hash_initial == lib_hash_final):
         print("Library operations were probably idempotent.")
 
-if __name__ == "__main__":
-    cli()
+
+# ---------------------------------------------------------------------------
+# Backblaze B2 (S3-compatible API) operations
+#
+# Adapted from https://github.com/backblaze-b2-samples/b2-python-s3-sample/
+# All configuration is read from the .env file (see ./.env) - no CLI options:
+#   BUCKET_ENDPOINT, KEY_ID, APPLICATION_KEY, BUCKET_NAME
+# ---------------------------------------------------------------------------
+
+
+def _connect():
+    """Return (client, bucket_name) built entirely from the .env file."""
+    creds = B2S3Utils.B2Credentials.from_env()
+    bucket = B2S3Utils.bucket_from_env()
+    return B2S3Utils.get_b2_client(creds), bucket
+
+
+@cli.group()
+def b2() -> None:
+    """Authenticate to and sync against the Backblaze B2 bucket from .env."""
+
+
+@b2.command("auth")
+def b2_auth() -> None:
+    """Verify the .env credentials can reach the configured bucket."""
+    creds = B2S3Utils.B2Credentials.from_env()
+    bucket = B2S3Utils.bucket_from_env()
+    try:
+        B2S3Utils.authenticate(bucket, creds)
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Authentication to '{bucket}' failed: {exc}") from exc
+    click.echo(f"OK: authenticated to '{bucket}' via {creds.endpoint}")
+
+
+@b2.command("list")
+def b2_list() -> None:
+    """List object keys with size / mtime / md5 for the configured bucket."""
+    client, bucket = _connect()
+    try:
+        rows = B2S3Utils.list_object_metadata(bucket, client)
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Listing '{bucket}' failed: {exc}") from exc
+    print(f"{'Last Modified':<20}  {'Size':>12}  {'MD5':<32}  Key")
+    print("-" * 80)
+    # TODO: Fixed-size print
+    for row in rows:
+        click.echo(f"{row.last_modified:%Y-%m-%d %H:%M:%S}  {row.size:>12d}  {row.md5}  {row.key}")
+    click.echo(f"\n{bucket}: {len(rows)} object(s)", err=True)
+
+@b2.command("upload")
+@click.option("--file-path", required=True, help="Path to the file to upload")
+@click.option(
+    "--replace-all-versions",
+    is_flag=True,
+    default=False,
+    help="After uploading, permanently delete every other version of this key.",
+)
+def b2_upload(file_path: str, replace_all_versions: bool) -> None:
+    """Upload a file to the configured bucket."""
+
+    client, bucket = _connect()
+    try:
+        result = B2S3Utils.upload_file(
+            bucket=bucket,
+            key=Path(file_path).name,
+            src=Path(file_path),
+            client=client,
+            content_type=None, # TODO: Maybe pull from tagstudio's set of known content types?
+            file_hash_sha1=hashlib.sha1(Path(file_path).read_bytes()).hexdigest(),
+            metadata=None,
+            prune_old_versions=replace_all_versions,
+        )
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Uploading '{file_path}' to '{bucket}' failed: {exc}") from exc
+    click.echo(f"OK: uploaded '{file_path}' to '{bucket}' (version {result.version_id})")
+
+@b2.command("delete")
+@click.option("--key", required=True, help="Key of the file to delete")
+def b2_delete(key: str) -> None:
+    """Delete a file from the configured bucket.
+
+    On a versioned bucket (B2's default) this hides the current version behind
+    a delete marker rather than erasing history - see "delete-all-versions" to
+    remove every version permanently.
+    """
+
+    client, bucket = _connect()
+    try:
+        B2S3Utils.delete_object(
+            bucket=bucket,
+            key=key,
+            client=client
+        )
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Deleting '{key}' from '{bucket}' failed: {exc}") from exc
+    click.echo(f"OK: deleted '{key}' from '{bucket}'")
+
+@b2.command("versions")
+@click.option("--key", default=None, help="Only show versions of this exact key (default: every key).")
+def b2_versions(key: str | None) -> None:
+    """List every stored version (and delete marker) of objects in the bucket."""
+
+    client, bucket = _connect()
+    try:
+        versions = B2S3Utils.list_object_versions(bucket, client, prefix=key or "")
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Listing versions in '{bucket}' failed: {exc}") from exc
+    if key:
+        versions = [v for v in versions if v.key == key]
+    print(f"{'Last Modified':<20}  {'Latest':<6}  {'Size':>12}  {'MD5':<32}  {'Version ID':<40}  Key")
+    print("-" * 130)
+    for v in versions:
+        size = f"{v.size:>12d}" if v.size is not None else f"{'(deleted)':>12}"
+        click.echo(
+            f"{v.last_modified:%Y-%m-%d %H:%M:%S}  {'yes' if v.is_latest else 'no':<6}  "
+            f"{size}  {(v.md5 or ''):<32}  {v.version_id:<40}  {v.key}"
+        )
+    click.echo(f"\n{bucket}: {len(versions)} version(s)", err=True)
+
+@b2.command("delete-version")
+@click.option("--key", required=True, help="Key of the object")
+@click.option("--version-id", required=True, help="Specific version id to delete (see 'b2 versions')")
+def b2_delete_version(key: str, version_id: str) -> None:
+    """Permanently delete one specific version of an object."""
+
+    client, bucket = _connect()
+    try:
+        B2S3Utils.delete_object_version(bucket=bucket, key=key, version_id=version_id, client=client)
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(
+            f"Deleting version '{version_id}' of '{key}' from '{bucket}' failed: {exc}"
+        ) from exc
+    click.echo(f"OK: deleted version '{version_id}' of '{key}' from '{bucket}'")
+
+@b2.command("delete-all-versions")
+@click.option("--key", required=True, help="Key of the object to remove completely")
+def b2_delete_all_versions(key: str) -> None:
+    """Permanently delete every version and delete marker of an object."""
+
+    client, bucket = _connect()
+    try:
+        count = B2S3Utils.delete_all_versions(bucket=bucket, key=key, client=client)
+    except (ClientError, BotoCoreError) as exc:
+        raise RuntimeError(f"Deleting all versions of '{key}' from '{bucket}' failed: {exc}") from exc
+    click.echo(f"OK: deleted {count} version(s) of '{key}' from '{bucket}'")
