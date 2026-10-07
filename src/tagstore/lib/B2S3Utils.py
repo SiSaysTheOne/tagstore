@@ -47,22 +47,22 @@ class B2Credentials:
         """
         load_dotenv(find_dotenv(usecwd=True) or None)
 
-        values = {
+        env_vars = {
             name: os.getenv(name)
             for name in ("BUCKET_ENDPOINT", "KEY_ID", "APPLICATION_KEY")
         }
-        missing = [name for name, value in values.items() if not value]
+        missing = [name for name, value in env_vars.items() if not value]
         if missing:
             raise RuntimeError(f"Missing B2 credentials in environment: {', '.join(missing)}")
 
-        endpoint = values["BUCKET_ENDPOINT"]
+        endpoint = env_vars["BUCKET_ENDPOINT"]
         if "://" not in endpoint:
             endpoint = "https://" + endpoint
 
         return cls(
             endpoint=endpoint,
-            key_id=values["KEY_ID"],
-            application_key=values["APPLICATION_KEY"],
+            key_id=env_vars["KEY_ID"],
+            application_key=env_vars["APPLICATION_KEY"],
         )
 
 
@@ -370,6 +370,7 @@ def _batch_delete_versions(
 ) -> int:
     """Permanently delete each of ``versions`` (a specific key + version id each)."""
     to_delete = [{"Key": v.key, "VersionId": v.version_id} for v in versions]
+    # Consider eradicating the cap
     for i in range(0, len(to_delete), 1000):  # delete_objects caps out at 1000/call
         chunk = to_delete[i : i + 1000]
         resp = client.delete_objects(Bucket=bucket, Delete={"Objects": chunk, "Quiet": True})

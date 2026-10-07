@@ -13,11 +13,18 @@ dependencies = [
     "botocore",
     "python-dotenv",
     "tagstudio",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic-settings",
+    "email-validator",
+    "pyjwt",
+    "python-multipart",
+    "bcrypt",
 ]
 
 [project.scripts]
 tagstore-cli = "tagstore.cli.main:cli"
-tagstore-api = "tagstore.api.main:api"
+tagstore-api = "tagstore.api.main:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tagstore"]

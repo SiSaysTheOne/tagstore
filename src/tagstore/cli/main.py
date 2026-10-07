@@ -25,31 +25,95 @@ class ExceptionHandlingGroup(click.Group):
 def cli():
     pass
 
-@cli.command()
-@click.option("--library-dir", required=True, help="Path to the library directory")
-@click.option("--bucket-path", required=True, help="Path to the cloud bucket")
-@click.option("--bucket-type", required=True, type=click.Choice(["b2"]), help="Type of the cloud bucket")
-def uploadLocalLibraryToBucket():
-    # TODO Implement this function to sync the local library to a cloud bucket
+# Files that compose a library: (flat file system, .TagStudio/ts_library.sqlite, and .TagStudio/ts_ignore)
 
-    
-
-    # TODO Blindly push all files to the bucket
-    
-    pass
+# TODO Abstract this CLI to be backup-solution agnostic
+# TODO? Abstract this CLI to be local filesystem agnostic
 
 @cli.command()
 @click.option("--library-dir", required=True, help="Path to the library directory")
-@click.option("--bucket-path", required=True, help="Path to the cloud bucket")
-@click.option("--bucket-type", required=True, type=click.Choice(["b2"]), help="Type of the cloud bucket")
-def syncLibraryFromBucket(library_dir: str, bucket_path: str, bucket_type: str):
-    # TODO Implement this function to sync the library from a cloud bucket to the local library
-    
-    # TODO Determine all files newer on the local store; push those files
-    # TODO Determine all files newer on the cloud store; pull those files
-    
-    pass
+@click.option(
+    "--override-existing",
+    is_flag=True,
+    default=False,
+    help="Override existing files in the target.",
+)
+def cloneLibrary(library_dir: str, override_existing: bool):
+    library_dir = Path(library_dir)
+    library_dir.mkdir(parents=True, exist_ok=True)
+    if(not library_dir.exists() or not library_dir.is_dir()):
+        raise FileNotFoundError(f"Library path does not exist or is not a directory: {library_dir}")
+    if(library_dir / ".TagStudio" / "ts_library.sqlite").exists() and not override_existing:
+        raise FileExistsError(f"Library path already contains a TagStudio library: {library_dir}")
 
+    client, bucket = _connect()
+
+    # Pull cloud library to local library
+    object_keys = B2S3Utils.list_object_keys(bucket, client)
+    if not object_keys:
+        raise FileNotFoundError(f"Bucket '{bucket}' is empty; nothing to clone.")
+    for key in object_keys:
+        B2S3Utils.download_file(bucket, key, library_dir / key, client)
+
+    # Reconstruct tagstudio library
+    lib = Library()
+    status = lib.open_library(library_dir)
+    if not status.success:
+        raise RuntimeError(f"Failed to open library after clone: {status.message}")
+    lib.close()
+
+    # TODO Verify that thumbnails are regenerated
+        # If not, create a new method to do so
+
+    click.echo(f"OK: cloned {len(object_keys)} object(s) from '{bucket}' into '{library_dir}'")
+
+# TODO? Keep a ledger of all changes; only push affected files
+# TODO? Parallelize uploads/downloads with threads
+@cli.command()
+@click.option("--library-dir", required=True, help="Path to the library directory")
+@click.option(
+    "--override-existing",
+    is_flag=True,
+    default=False,
+    help="Override existing files in the target.",
+)
+@click.option(
+    "--clear-bucket",
+    is_flag=True,
+    default=False,
+    help="Clear the bucket before uploading.",
+)
+def backupLibrary(library_dir: str, override_existing: bool, clear_bucket: bool):
+
+    library_dir = Path(library_dir)
+    if(not library_dir.exists() or not library_dir.is_dir()):
+        raise FileNotFoundError(f"Library path does not exist or is not a directory: {library_dir}")
+    
+    client, bucket = _connect()
+
+    object_keys = B2S3Utils.list_object_keys(bucket, client)
+    if(clear_bucket):
+        for key in object_keys:
+            B2S3Utils.delete_object(bucket, key, client)
+        click.echo(f"OK: cleared {len(object_keys)} object(s) from '{bucket}'")
+        object_keys = []
+    elif(object_keys and not override_existing):
+        raise FileExistsError(f"Bucket '{bucket}' is not empty. Use --override-existing to override.")
+
+    # Push local library to the cloud bucket
+    thumbs_dir = library_dir / ".TagStudio" / "thumbs"
+    files = [
+        file for file in library_dir.rglob("*")
+        if file.is_file() and not file.is_relative_to(thumbs_dir)
+    ]
+    for file in files:
+        key = file.relative_to(library_dir).as_posix()
+        file_hash_sha1 = hashlib.sha1(file.read_bytes()).hexdigest()
+        B2S3Utils.upload_file(bucket, key, file, client, file_hash_sha1=file_hash_sha1)
+
+    click.echo(f"OK: backed up {len(files)} file(s) from '{library_dir}' to '{bucket}'")
+
+# TODO: Declare as a local filesystem operation
 @cli.command()
 @click.option("--library-dir", required=True, help="Path to the library directory")
 @click.option("--files-dir", required=True, help="Path to the files directory")
