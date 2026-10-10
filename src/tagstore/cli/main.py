@@ -14,12 +14,34 @@ class ExceptionHandlingGroup(click.Group):
     def invoke(self, ctx):
         try:
             return super().invoke(ctx)
-        except (click.exceptions.Exit, click.Abort):
-            # Normal exit / Ctrl-C sentinels - let click handle them.
+        except (click.exceptions.Exit, click.Abort, click.ClickException):
+            # Normal exit / Ctrl-C sentinels / usage errors - let click handle them.
             raise
         except Exception as e:
             click.echo(f"Error: {e}", err=True)
             ctx.exit(1)
+
+# An unset shell variable (e.g. --library-dir=$TYPO) arrives as "", which Path() silently turns into "."
+EMPTY_ARG_MESSAGE = "must not be empty (is the shell variable you passed set?)"
+
+class NonEmptyText(click.ParamType):
+    name = "text"
+
+    def convert(self, value, param, ctx):
+        if(not str(value).strip()):
+            self.fail(EMPTY_ARG_MESSAGE, param, ctx)
+        return str(value)
+
+class NonEmptyPath(click.Path):
+    def convert(self, value, param, ctx):
+        if(not str(value).strip()):
+            self.fail(EMPTY_ARG_MESSAGE, param, ctx)
+        return super().convert(value, param, ctx)
+
+# Resolved to absolute paths so the overlap checks in copyFilesToLibrary compare like with like
+NEW_OR_EXISTING_DIR = NonEmptyPath(file_okay=False, resolve_path=True)
+EXISTING_DIR = NonEmptyPath(exists=True, file_okay=False, resolve_path=True)
+EXISTING_FILE = NonEmptyPath(exists=True, dir_okay=False, resolve_path=True)
 
 @click.group(cls=ExceptionHandlingGroup)
 def cli():
@@ -31,7 +53,7 @@ def cli():
 # TODO? Abstract this CLI to be local filesystem agnostic
 
 @cli.command()
-@click.option("--library-dir", required=True, help="Path to the library directory")
+@click.option("--library-dir", required=True, type=NEW_OR_EXISTING_DIR, help="Path to the library directory")
 @click.option(
     "--override-existing",
     is_flag=True,
@@ -70,7 +92,7 @@ def cloneLibrary(library_dir: str, override_existing: bool):
 # TODO? Keep a ledger of all changes; only push affected files
 # TODO? Parallelize uploads/downloads with threads
 @cli.command()
-@click.option("--library-dir", required=True, help="Path to the library directory")
+@click.option("--library-dir", required=True, type=EXISTING_DIR, help="Path to the library directory")
 @click.option(
     "--override-existing",
     is_flag=True,
@@ -115,8 +137,8 @@ def backupLibrary(library_dir: str, override_existing: bool, clear_bucket: bool)
 
 # TODO: Declare as a local filesystem operation
 @cli.command()
-@click.option("--library-dir", required=True, help="Path to the library directory")
-@click.option("--files-dir", required=True, help="Path to the files directory")
+@click.option("--library-dir", required=True, type=NEW_OR_EXISTING_DIR, help="Path to the library directory")
+@click.option("--files-dir", required=True, type=EXISTING_DIR, help="Path to the files directory")
 @click.option("--delete-source", is_flag=True, default=False, help="Delete source files after copying")
 def copyFilesToLibrary(library_dir: str, files_dir: str, delete_source: bool) -> None:
     library_dir = Path(library_dir)
@@ -215,7 +237,7 @@ def b2_list() -> None:
     click.echo(f"\n{bucket}: {len(rows)} object(s)", err=True)
 
 @b2.command("upload")
-@click.option("--file-path", required=True, help="Path to the file to upload")
+@click.option("--file-path", required=True, type=EXISTING_FILE, help="Path to the file to upload")
 @click.option(
     "--replace-all-versions",
     is_flag=True,
@@ -242,7 +264,7 @@ def b2_upload(file_path: str, replace_all_versions: bool) -> None:
     click.echo(f"OK: uploaded '{file_path}' to '{bucket}' (version {result.version_id})")
 
 @b2.command("delete")
-@click.option("--key", required=True, help="Key of the file to delete")
+@click.option("--key", required=True, type=NonEmptyText(), help="Key of the file to delete")
 def b2_delete(key: str) -> None:
     """Delete a file from the configured bucket.
 
@@ -263,7 +285,7 @@ def b2_delete(key: str) -> None:
     click.echo(f"OK: deleted '{key}' from '{bucket}'")
 
 @b2.command("versions")
-@click.option("--key", default=None, help="Only show versions of this exact key (default: every key).")
+@click.option("--key", default=None, type=NonEmptyText(), help="Only show versions of this exact key (default: every key).")
 def b2_versions(key: str | None) -> None:
     """List every stored version (and delete marker) of objects in the bucket."""
 
@@ -285,8 +307,8 @@ def b2_versions(key: str | None) -> None:
     click.echo(f"\n{bucket}: {len(versions)} version(s)", err=True)
 
 @b2.command("delete-version")
-@click.option("--key", required=True, help="Key of the object")
-@click.option("--version-id", required=True, help="Specific version id to delete (see 'b2 versions')")
+@click.option("--key", required=True, type=NonEmptyText(), help="Key of the object")
+@click.option("--version-id", required=True, type=NonEmptyText(), help="Specific version id to delete (see 'b2 versions')")
 def b2_delete_version(key: str, version_id: str) -> None:
     """Permanently delete one specific version of an object."""
 
@@ -300,7 +322,7 @@ def b2_delete_version(key: str, version_id: str) -> None:
     click.echo(f"OK: deleted version '{version_id}' of '{key}' from '{bucket}'")
 
 @b2.command("delete-all-versions")
-@click.option("--key", required=True, help="Key of the object to remove completely")
+@click.option("--key", required=True, type=NonEmptyText(), help="Key of the object to remove completely")
 def b2_delete_all_versions(key: str) -> None:
     """Permanently delete every version and delete marker of an object."""
 
