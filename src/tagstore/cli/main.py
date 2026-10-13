@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 from pathlib import Path
 from tagstore.lib.LibraryUtils import LibUtils
 from tagstore.lib.FileSystemUtils import FileSystemUtils
@@ -186,6 +187,70 @@ def copyFilesToLibrary(library_dir: str, files_dir: str, delete_source: bool) ->
     print(f"Library hash (final): {lib_hash_final}")
     if(lib_hash_initial == lib_hash_final):
         print("Library operations were probably idempotent.")
+
+# TODO: Declare as a local filesystem operation
+@cli.command()
+@click.argument("host-library", type=EXISTING_DIR)
+@click.argument("target-library", type=EXISTING_DIR)
+@click.option(
+    "--delete-target",
+    is_flag=True,
+    default=False,
+    help="Delete the target library once all of its entries are in the host.",
+)
+def mergeLibraries(host_library: str, target_library: str, delete_target: bool) -> None:
+    """Merge TARGET_LIBRARY's files, fields, and tags into HOST_LIBRARY."""
+    host_dir = Path(host_library)
+    target_dir = Path(target_library)
+
+    if(host_dir == target_dir):
+        raise ValueError("Host library and target library cannot be the same.")
+    if(host_dir in target_dir.parents):
+        raise ValueError("Host library cannot be a parent of target library.")
+    if(target_dir in host_dir.parents):
+        raise ValueError("Target library cannot be a parent of host library.")
+    # Library.open_library() creates a new library when none exists; only merge real ones
+    for library_dir in (host_dir, target_dir):
+        if(not (library_dir / ".TagStudio" / "ts_library.sqlite").is_file()):
+            raise FileNotFoundError(f"Not a TagStudio library (no .TagStudio/ts_library.sqlite): {library_dir}")
+
+    host = Library()
+    target = Library()
+    try:
+        for lib, library_dir in ((host, host_dir), (target, target_dir)):
+            status = lib.open_library(library_dir)
+            if not status.success:
+                raise RuntimeError(f"Failed to open library {library_dir}: {status.message}")
+
+        copied, deduplicated, missing = LibUtils.merge_library(host, target)
+    finally:
+        host.close()
+        target.close()
+
+    click.echo(
+        f"OK: merged '{target_dir}' into '{host_dir}': {len(copied)} copied, "
+        f"{len(deduplicated)} already present, {len(missing)} missing on disk"
+    )
+
+    if not delete_target:
+        return
+    if missing:
+        raise RuntimeError(
+            f"Not deleting target: {len(missing)} entr{'y' if len(missing) == 1 else 'ies'} had no file on disk, "
+            f"so their tags and fields would be lost. Fix or remove them in '{target_dir}' first."
+        )
+
+    for file in copied + deduplicated:
+        file.unlink()
+    shutil.rmtree(target_dir / ".TagStudio")
+    FileSystemUtils.remove_empty_directories(target_dir)
+
+    leftovers = list(target_dir.rglob("*"))
+    if leftovers:
+        click.echo(f"Kept '{target_dir}': {len(leftovers)} non-library item(s) remain (e.g. {leftovers[0]})")
+    else:
+        target_dir.rmdir()
+        click.echo(f"OK: deleted target library '{target_dir}'")
 
 
 # ---------------------------------------------------------------------------

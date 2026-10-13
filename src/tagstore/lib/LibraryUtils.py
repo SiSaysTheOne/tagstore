@@ -7,8 +7,11 @@ from tagstore.lib.FileSystemUtils import FileSystemUtils
 from tagstudio.core.library.alchemy.fields import TextField
 from tagstudio.core.library.alchemy.library import Library
 from tagstudio.core.library.alchemy.models import Tag
+from tagstudio.core.constants import RESERVED_TAG_END
 from datetime import datetime as dt
 from tagstudio.core.library.alchemy.models import Entry
+
+# TODO: Add a mode to that applies tags as a set rather than a lineage (Squash)
 
 class fs_driver_local:
     # Implement local filesystem driver for uploading files to a local directory
@@ -76,13 +79,36 @@ class fs_driver_B2:
 # TODO: Convert to fs_driver_local
 class LibUtils:
     tag_cache: dict[tuple[Library, str], Tag] = {}
-    
+
+    @staticmethod
+    def get_tag(lib: Library, name: str) -> Tag | None:
+        cached = LibUtils.tag_cache.get((lib, name))
+        if cached is not None:
+            return cached
+
+        tag = lib.get_tag_by_name(name)
+        if tag is not None:
+            LibUtils.tag_cache[(lib, name)] = tag
+            return tag
+
+        return None
+
+    @staticmethod
+    def create_tag(lib: Library, name: str, parent: Tag | None) -> Tag:
+        parent_ids = {parent.id} if parent is not None else set()
+        new_tag = lib.add_tag(Tag(name=name), parent_ids=parent_ids)
+        if new_tag is None:
+            raise RuntimeError(f"Failed to create tag '{name}'")
+        LibUtils.tag_cache[(lib, name)] = new_tag
+        return new_tag
+
+    # Tuple[0] = Tag, Tuple[1] = bool (True if created, False if already existed)
     @staticmethod
     def get_or_create_tag(lib: Library, name: str, parent: Tag | None) -> Tag:
         cached = LibUtils.tag_cache.get((lib, name))
         if cached is not None:
             return cached
-
+    
         tag = lib.get_tag_by_name(name)
         if tag is not None:
             LibUtils.tag_cache[(lib, name)] = tag
@@ -97,17 +123,31 @@ class LibUtils:
 
     @staticmethod
     def tag_directory_hierarchy(lib: Library, path: Path, entry_id: int) -> None:
-        parts = [part for part in path.parent.parts if part not in (".", "")]
+        directory_topToBottom = list(path.parent.parts).__reversed__()
+        
+        # Create a new tag for the top-level directory if it is not already a tag
+        # For each subsequent directory, create a new tag if there is not a child tag with that name under the previous diretory's tag
+        
+        parts = [part for part in directory_topToBottom if part not in (".", "")]
         print(f"tagging entry {entry_id} with path {path} with directory hierarchy: {parts}")
         if not parts:
             return
 
-        parent_tag: Tag | None = None
-        for part in parts:
-            parent_tag = LibUtils.get_or_create_tag(lib=lib, name=part, parent=parent_tag)
-            print(f"created tag for entry {entry_id} with tag {parent_tag.name}")
+        current_tag: Tag | None = LibUtils.get_or_create_tag(lib, parts[0], parent=None)  # Create the root tag if nonexistent
+        if current_tag is None:
+            raise RuntimeError(f"Failed to create or retrieve root tag '{parts[0]}' for entry {entry_id}")
 
-        lib.add_tags_to_entries(entry_ids=entry_id, tag_ids=parent_tag.id)
+        for part in parts[1:]:
+
+            if part in current_tag.children:
+                current_tag = current_tag.children[part]
+            else:
+                current_tag = LibUtils.create_tag(lib, part, current_tag) 
+
+            if current_tag is None:
+                raise RuntimeError(f"Current tag is None while processing part '{part}' for entry {entry_id}")
+
+        lib.add_tags_to_entries(entry_ids=entry_id, tag_ids=current_tag.id)
 
     @staticmethod
     def add_all_files_to_library(lib: Library) -> None:
@@ -133,19 +173,22 @@ class LibUtils:
         # Compare hash to existing files in the library
         colliding_entry: Entry | None = None
         for entry in lib.all_entries():
-            if any(field.name == "file_hash" and field.value == file_hash for field in entry.fields):
+            if any(
+                field.name == "file_hash" 
+                and field.value == file_hash for field in entry.fields
+            ):
                 colliding_entry = entry
                 break
 
         # If the file already exists in the library, copy tags and skip file upload
         if colliding_entry is not None:
-            existing_path = lib.library_dir / colliding_entry.path
+            colliding_path = lib.library_dir / colliding_entry.path
             # If the hash collides, compare file bytestreams
-            if existing_path.exists() and filecmp.cmp(uploaded_file, existing_path, shallow=False):
+            if colliding_path.exists() and filecmp.cmp(uploaded_file, colliding_path, shallow=False):
                 # If the bytestreams are identical, copy new tags onto the existing file and inform the user
                 LibUtils.tag_directory_hierarchy(lib, relative, colliding_entry.id)
-                print(f"{uploaded_file} duplicates existing entry {existing_path}; merged tags instead of adding a new entry.")
-                return existing_path
+                print(f"{uploaded_file} duplicates existing entry {colliding_path}; merged tags instead of adding a new entry.")
+                return colliding_path
 
         # Copy file to library root with a new unique name
         libFile_relativePath = FileSystemUtils.find_new_path(lib.library_dir, uploaded_file.suffix)
@@ -215,3 +258,143 @@ class LibUtils:
                     continue
             
             lib.update_entry_path(entry.id, new_path)
+
+    @staticmethod
+    def map_tags(host: Library, target: Library) -> dict[int, int]:
+        """Map every target tag id to an equivalent host tag id, creating host tags as needed.
+
+        Tags match on name plus (already mapped) parents, so same-named tags under
+        different parents stay distinct.
+        """
+        host_index: list[tuple[int, str, frozenset[int]]] = [
+            (tag.id, tag.name, frozenset(parent.id for parent in tag.parent_tags)) for tag in host.tags
+        ]
+        tag_map: dict[int, int] = {}
+        cyclic_links: list[tuple[int, int]] = []
+
+        def resolve(tag_id: int, visiting: set[int]) -> int:
+            if tag_id in tag_map:
+                return tag_map[tag_id]
+            # Built-in tags (Archived, Favorite, Meta, ...) have the same ids in every library
+            if tag_id <= RESERVED_TAG_END:
+                tag_map[tag_id] = tag_id
+                return tag_id
+
+            tag = target.get_tag(tag_id)
+            if tag is None:
+                raise RuntimeError(f"Target tag {tag_id} disappeared while merging")
+
+            visiting.add(tag_id)
+            parent_ids: set[int] = set()
+            for parent in tag.parent_tags:
+                if parent.id in visiting:
+                    # Parent cycle: link it once both ends exist in the host
+                    cyclic_links.append((parent.id, tag_id))
+                else:
+                    parent_ids.add(resolve(parent.id, visiting))
+            visiting.discard(tag_id)
+
+            match = next(
+                (host_id for host_id, name, parents in host_index if name == tag.name and parents == parent_ids),
+                None,
+            )
+            if match is None:
+                has_color = tag.color_slug is not None and host.get_tag_color(tag.color_slug, tag.color_namespace) is not None
+                new_tag = host.add_tag(
+                    Tag(
+                        name=tag.name,
+                        shorthand=tag.shorthand,
+                        icon=tag.icon,
+                        color_namespace=tag.color_namespace if has_color else None,
+                        color_slug=tag.color_slug if has_color else None,
+                        is_category=tag.is_category,
+                        is_hidden=tag.is_hidden,
+                    ),
+                    parent_ids=parent_ids,
+                )
+                if new_tag is None:
+                    raise RuntimeError(f"Failed to create tag '{tag.name}' in host library")
+                # add_tag(aliases=...) inserts them before they have a tag id, so add them afterwards
+                for alias in tag.aliases:
+                    host.add_alias(alias.name, new_tag.id)
+                print(f"created tag '{tag.name}' in host library")
+                match = new_tag.id
+                host_index.append((match, tag.name, frozenset(parent_ids)))
+
+            tag_map[tag_id] = match
+            return match
+
+        for tag in target.tags:
+            resolve(tag.id, set())
+        for parent_id, child_id in cyclic_links:
+            host.add_parent_tag(tag_map[parent_id], tag_map[child_id])
+
+        return tag_map
+
+    @staticmethod
+    def merge_library(host: Library, target: Library) -> tuple[list[Path], list[Path], list[Path]]:
+        """Copy every target entry (file, fields, tags) into host.
+
+        Files already in host (same hash and bytes) are not copied again; the target's
+        fields and tags are merged onto the existing entry instead, so re-running is safe.
+        Returns (copied, deduplicated, missing) lists of target file paths.
+        """
+        LibUtils.tag_cache.clear()
+        tag_map = LibUtils.map_tags(host, target)
+
+        # file_hash -> (host entry id, host path, fields already on that entry)
+        host_hashes: dict[str, tuple[int, Path, set]] = {}
+        for entry in host.all_entries(with_joins=True):
+            for field in entry.text_fields:
+                if field.name == "file_hash" and field.value:
+                    host_hashes[field.value] = (entry.id, entry.path, set(entry.fields))
+
+        copied: list[Path] = []
+        deduplicated: list[Path] = []
+        missing: list[Path] = []
+        for entry in target.all_entries(with_joins=True):
+            source = target.library_dir / entry.path
+            if not source.is_file():
+                print(f"Entry path does not exist: {source}")
+                missing.append(source)
+                continue
+
+            file_hash = FileSystemUtils.hash_file(source)
+            existing = host_hashes.get(file_hash)
+            if(existing is not None
+               and (host.library_dir / existing[1]).is_file()
+               and filecmp.cmp(source, host.library_dir / existing[1], shallow=False)):
+                entry_id, _, host_fields = existing
+                print(f"{source} duplicates existing entry {host.library_dir / existing[1]}; merged tags and fields instead of adding a new entry.")
+                deduplicated.append(source)
+            else:
+                new_path = FileSystemUtils.find_new_path(host.library_dir, source.suffix)
+                shutil.copy2(source, host.library_dir / new_path)
+                FileSystemUtils.validate_file(source, host.library_dir / new_path)
+                entry_id = host.add_entries([Entry(
+                    path=new_path,
+                    folder=host.folder,
+                    fields=[],
+                    date_created=entry.date_created,
+                    date_modified=entry.date_modified,
+                    date_added=entry.date_added,
+                )])[0]
+                host_fields = set()
+                host_hashes[file_hash] = (entry_id, new_path, host_fields)
+                copied.append(source)
+
+            fields = list(entry.fields)
+            if not any(field.name == "file_hash" for field in fields):
+                fields.append(TextField(name="file_hash", value=file_hash, is_multiline=False))
+            if not any(field.name == "name" for field in fields):
+                fields.append(TextField(name="name", value=Path(entry.filename).stem, is_multiline=False))
+            for field in fields:
+                if field not in host_fields:
+                    host.add_field_to_entries(entry_ids=entry_id, field=field)
+                    host_fields.add(field)
+
+            host.add_tags_to_entries(entry_ids=entry_id, tag_ids=[tag_map[tag.id] for tag in entry.tags])
+            if entry.path.parent != Path("."):
+                LibUtils.tag_directory_hierarchy(host, entry.path, entry_id)
+
+        return copied, deduplicated, missing
