@@ -259,77 +259,77 @@ class LibUtils:
             
             lib.update_entry_path(entry.id, new_path)
 
-    @staticmethod
-    def map_tags(host: Library, target: Library) -> dict[int, int]:
-        """Map every target tag id to an equivalent host tag id, creating host tags as needed.
+    # @staticmethod
+    # def map_tags(host: Library, target: Library) -> dict[int, int]:
+    #     """Map every target tag id to an equivalent host tag id, creating host tags as needed.
 
-        Tags match on name plus (already mapped) parents, so same-named tags under
-        different parents stay distinct.
-        """
-        host_index: list[tuple[int, str, frozenset[int]]] = [
-            (tag.id, tag.name, frozenset(parent.id for parent in tag.parent_tags)) for tag in host.tags
-        ]
-        tag_map: dict[int, int] = {}
-        cyclic_links: list[tuple[int, int]] = []
+    #     Tags match on name plus (already mapped) parents, so same-named tags under
+    #     different parents stay distinct.
+    #     """
+    #     host_index: list[tuple[int, str, frozenset[int]]] = [
+    #         (tag.id, tag.name, frozenset(parent.id for parent in tag.parent_tags)) for tag in host.tags
+    #     ]
+    #     tag_map: dict[int, int] = {}
+    #     cyclic_links: list[tuple[int, int]] = []
 
-        def resolve(tag_id: int, visiting: set[int]) -> int:
-            if tag_id in tag_map:
-                return tag_map[tag_id]
-            # Built-in tags (Archived, Favorite, Meta, ...) have the same ids in every library
-            if tag_id <= RESERVED_TAG_END:
-                tag_map[tag_id] = tag_id
-                return tag_id
+    #     def resolve(tag_id: int, visiting: set[int]) -> int:
+    #         if tag_id in tag_map:
+    #             return tag_map[tag_id]
+    #         # Built-in tags (Archived, Favorite, Meta, ...) have the same ids in every library
+    #         if tag_id <= RESERVED_TAG_END:
+    #             tag_map[tag_id] = tag_id
+    #             return tag_id
 
-            tag = target.get_tag(tag_id)
-            if tag is None:
-                raise RuntimeError(f"Target tag {tag_id} disappeared while merging")
+    #         tag = target.get_tag(tag_id)
+    #         if tag is None:
+    #             raise RuntimeError(f"Target tag {tag_id} disappeared while merging")
 
-            visiting.add(tag_id)
-            parent_ids: set[int] = set()
-            for parent in tag.parent_tags:
-                if parent.id in visiting:
-                    # Parent cycle: link it once both ends exist in the host
-                    cyclic_links.append((parent.id, tag_id))
-                else:
-                    parent_ids.add(resolve(parent.id, visiting))
-            visiting.discard(tag_id)
+    #         visiting.add(tag_id)
+    #         parent_ids: set[int] = set()
+    #         for parent in tag.parent_tags:
+    #             if parent.id in visiting:
+    #                 # Parent cycle: link it once both ends exist in the host
+    #                 cyclic_links.append((parent.id, tag_id))
+    #             else:
+    #                 parent_ids.add(resolve(parent.id, visiting))
+    #         visiting.discard(tag_id)
 
-            match = next(
-                (host_id for host_id, name, parents in host_index if name == tag.name and parents == parent_ids),
-                None,
-            )
-            if match is None:
-                has_color = tag.color_slug is not None and host.get_tag_color(tag.color_slug, tag.color_namespace) is not None
-                new_tag = host.add_tag(
-                    Tag(
-                        name=tag.name,
-                        shorthand=tag.shorthand,
-                        icon=tag.icon,
-                        color_namespace=tag.color_namespace if has_color else None,
-                        color_slug=tag.color_slug if has_color else None,
-                        is_category=tag.is_category,
-                        is_hidden=tag.is_hidden,
-                    ),
-                    parent_ids=parent_ids,
-                )
-                if new_tag is None:
-                    raise RuntimeError(f"Failed to create tag '{tag.name}' in host library")
-                # add_tag(aliases=...) inserts them before they have a tag id, so add them afterwards
-                for alias in tag.aliases:
-                    host.add_alias(alias.name, new_tag.id)
-                print(f"created tag '{tag.name}' in host library")
-                match = new_tag.id
-                host_index.append((match, tag.name, frozenset(parent_ids)))
+    #         match = next(
+    #             (host_id for host_id, name, parents in host_index if name == tag.name and parents == parent_ids),
+    #             None,
+    #         )
+    #         if match is None:
+    #             has_color = tag.color_slug is not None and host.get_tag_color(tag.color_slug, tag.color_namespace) is not None
+    #             new_tag = host.add_tag(
+    #                 Tag(
+    #                     name=tag.name,
+    #                     shorthand=tag.shorthand,
+    #                     icon=tag.icon,
+    #                     color_namespace=tag.color_namespace if has_color else None,
+    #                     color_slug=tag.color_slug if has_color else None,
+    #                     is_category=tag.is_category,
+    #                     is_hidden=tag.is_hidden,
+    #                 ),
+    #                 parent_ids=parent_ids,
+    #             )
+    #             if new_tag is None:
+    #                 raise RuntimeError(f"Failed to create tag '{tag.name}' in host library")
+    #             # add_tag(aliases=...) inserts them before they have a tag id, so add them afterwards
+    #             for alias in tag.aliases:
+    #                 host.add_alias(alias.name, new_tag.id)
+    #             print(f"created tag '{tag.name}' in host library")
+    #             match = new_tag.id
+    #             host_index.append((match, tag.name, frozenset(parent_ids)))
 
-            tag_map[tag_id] = match
-            return match
+    #         tag_map[tag_id] = match
+    #         return match
 
-        for tag in target.tags:
-            resolve(tag.id, set())
-        for parent_id, child_id in cyclic_links:
-            host.add_parent_tag(tag_map[parent_id], tag_map[child_id])
+    #     for tag in target.tags:
+    #         resolve(tag.id, set())
+    #     for parent_id, child_id in cyclic_links:
+    #         host.add_parent_tag(tag_map[parent_id], tag_map[child_id])
 
-        return tag_map
+    #     return tag_map
 
     @staticmethod
     def merge_library(host: Library, target: Library) -> tuple[list[Path], list[Path], list[Path]]:
